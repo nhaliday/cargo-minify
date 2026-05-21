@@ -60,7 +60,9 @@ pub fn get_unused<'a>(
                 None
             }
         })
-        .filter(move |message| targets.contains(&message.target))
+        .filter(move |message| {
+            targets.contains(&resolver::normalize_target(message.target.clone()))
+        })
         .map(|message| message.message)
         .filter_map(|diagnostic| UnusedDiagnostic::try_from(diagnostic).ok())
         // Ignore unused warnings originating from macro expansions

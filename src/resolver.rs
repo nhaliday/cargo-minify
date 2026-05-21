@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use cargo_metadata::Target;
+use cargo_metadata::{camino::Utf8PathBuf, Target};
 
 use crate::{error::Result, CrateResolutionOptions};
 
@@ -34,7 +34,24 @@ pub fn get_targets(
         eprintln!("crate resolution found no targets");
     }
 
-    Ok(targets)
+    Ok(targets.into_iter().map(normalize_target).collect())
+}
+
+/// Canonicalizes `Target.src_path` so HashSet equality is robust to symlinks.
+/// On macOS in particular, `/var/folders/...` is a symlink to
+/// `/private/var/folders/...`, and the two subprocess invocations cargo-minify
+/// makes (`cargo metadata` in this module, `cargo check` in unused.rs) can end
+/// up with different src_path normalizations for the same target. Because
+/// `cargo_metadata::Target` derives full-struct equality (including src_path),
+/// any mismatch makes `targets.contains(&message.target)` miss and every
+/// diagnostic gets silently dropped. Applied on both sides of the comparison.
+pub fn normalize_target(mut t: Target) -> Target {
+    if let Ok(canonical) = PathBuf::from(t.src_path.as_str()).canonicalize() {
+        if let Ok(utf8) = Utf8PathBuf::from_path_buf(canonical) {
+            t.src_path = utf8;
+        }
+    }
+    t
 }
 
 fn root_targets(manifest_path: Option<&Path>, targets: &mut HashSet<Target>) -> Result<()> {
@@ -140,6 +157,81 @@ fn package_targets(
             format!("package `{}` is not a member of the workspace", package),
         )
         .into())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod test {
+    use std::{
+        collections::HashSet,
+        os::unix::fs::symlink,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+
+    use cargo_metadata::Target;
+
+    use super::*;
+
+    fn target_with_src_path(src_path: &str) -> Target {
+        serde_json::from_value(serde_json::json!({
+            "name": "t",
+            "kind": ["bin"],
+            "src_path": src_path,
+        }))
+        .unwrap()
+    }
+
+    fn temp_subdir() -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "cargo-minify-resolver-{}-{}",
+            std::process::id(),
+            n
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // Two Target objects whose src_paths point at the same file via different
+    // symlink resolutions should compare equal after normalization. Before the
+    // fix, `targets.contains(&message.target)` missed when cargo metadata and
+    // cargo check produced different normalizations (e.g., macOS's
+    // `/var/folders/...` vs `/private/var/folders/...`), silently dropping
+    // every diagnostic.
+    #[test]
+    fn normalize_target_resolves_symlinks() {
+        let dir = temp_subdir();
+        let real = dir.join("real.rs");
+        let link = dir.join("link.rs");
+        std::fs::write(&real, b"fn main() {}").unwrap();
+        symlink(&real, &link).unwrap();
+
+        let via_link = target_with_src_path(link.to_str().unwrap());
+        let via_real = target_with_src_path(real.canonicalize().unwrap().to_str().unwrap());
+        assert_ne!(via_link, via_real, "raw Targets must differ");
+
+        let mut set = HashSet::new();
+        set.insert(normalize_target(via_link));
+        assert!(
+            set.contains(&normalize_target(via_real)),
+            "HashSet lookup should hit after symlink normalization"
+        );
+
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_file(&real).ok();
+        std::fs::remove_dir(&dir).ok();
+    }
+
+    // When canonicalize fails (e.g., file doesn't exist), the original path is
+    // preserved — equality behavior is unchanged for those targets.
+    #[test]
+    fn normalize_target_preserves_unresolvable_path() {
+        let path = "/this/path/definitely/does/not/exist.rs";
+        let t = target_with_src_path(path);
+        let n = normalize_target(t.clone());
+        assert_eq!(n.src_path.as_str(), path);
+        assert_eq!(n, t);
     }
 }
 
