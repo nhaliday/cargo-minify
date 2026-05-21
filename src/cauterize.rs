@@ -59,7 +59,7 @@ fn find_suffix_whitespace(src: &[u8]) -> usize {
 /// Turns a list of "locations of identifiers" into a list of "chunks"
 fn diagnostics_to_ranges<'a>(
     src: &'a [u8],
-    idents: impl IntoIterator<Item = (UnusedDiagnosticKind, String)> + 'a,
+    idents: impl IntoIterator<Item = (UnusedDiagnosticKind, String, Option<usize>)> + 'a,
 ) -> Result<impl Iterator<Item = Range<usize>> + 'a, syn::Error> {
     let s = String::from_utf8_lossy(src);
     let parsed = syn::parse_str::<syn::File>(&s)?;
@@ -68,91 +68,80 @@ fn diagnostics_to_ranges<'a>(
 
     let ranges = idents
         .into_iter()
-        .flat_map(move |(kind, ident)| {
-            parsed.items.iter().find_map(|item| {
-                use syn::{ForeignItem, ImplItem, Item};
-                use UnusedDiagnosticKind::*;
-                let item_ident = match item {
-                    Item::Const(obj) if kind == Constant => &obj.ident,
-                    Item::Enum(obj) if kind == Enum => &obj.ident,
-                    Item::Fn(obj) if kind == Function => &obj.sig.ident,
-                    Item::Macro(syn::ItemMacro {
-                        ident: Some(name), ..
-                    }) if kind == MacroDefinition => name,
-                    Item::Static(obj) if kind == Static => &obj.ident,
-                    Item::Struct(obj) if kind == Struct => &obj.ident,
-                    Item::Type(obj) if kind == TypeAlias => &obj.ident,
-                    Item::Union(obj) if kind == Union => &obj.ident,
-                    Item::Mod(block) => return handle_mod_diagnostic(block, &kind, &ident),
-                    Item::ForeignMod(block) => {
-                        return block.items.iter().find_map(|item| {
-                            let item_ident = match item {
-                                ForeignItem::Fn(obj) if kind == Function => &obj.sig.ident,
-                                ForeignItem::Static(obj) if kind == Static => &obj.ident,
-                                ForeignItem::Type(obj) if kind == TypeAlias => &obj.ident,
-                                _ => return None,
-                            };
-
-                            if *item_ident == ident {
-                                Some(item.span())
-                            } else {
-                                None
-                            }
-                        })
-                    }
-                    Item::Impl(block) => {
-                        return block.items.iter().find_map(|item| {
-                            let item_ident = match item {
-                                ImplItem::Const(obj) if kind == Constant => &obj.ident,
-                                ImplItem::Fn(obj) if kind == AssociatedFunction => &obj.sig.ident,
-                                ImplItem::Type(obj) if kind == TypeAlias => &obj.ident,
-                                _ => return None,
-                            };
-
-                            if *item_ident == ident {
-                                Some(item.span())
-                            } else {
-                                None
-                            }
-                        })
-                    }
-                    _ => return None,
-                };
-
-                if *item_ident == ident {
-                    Some(item.span())
-                } else {
-                    None
-                }
-            })
-        })
+        .filter_map(move |(kind, ident, line)| find_item(&parsed.items, &kind, &ident, line))
         .map(move |span| to_range(&cumulative_lengths, span));
 
     Ok(ranges)
 }
 
-/// Handles (inline) module content
-fn handle_mod_diagnostic(block: &syn::ItemMod, kind: &UnusedDiagnosticKind, ident: &str) -> Option<proc_macro2::Span> {
-    use syn::Item;
+/// Walks `items` (the top-level items of a file or the contents of an inline
+/// `mod`) for an item matching `kind`, `ident`, and `line`. Descends into
+/// `mod`, `extern`, and `impl` blocks. The same walker runs at every depth, so
+/// any kind handled at the top level is also handled when nested — the
+/// previous split between this and a more limited recursive helper left
+/// Const/Enum/Struct/Union/MacroDefinition/ForeignMod/Impl unfindable inside
+/// nested modules.
+///
+/// `line` is the 1-indexed source line rustc pointed at; items on other lines
+/// are skipped, disambiguating same-named items in different scopes. `None`
+/// disables the line check, which is used by tests with synthetic input.
+fn find_item(
+    items: &[syn::Item],
+    kind: &UnusedDiagnosticKind,
+    ident: &str,
+    line: Option<usize>,
+) -> Option<proc_macro2::Span> {
+    use syn::{ForeignItem, ImplItem, Item};
     use UnusedDiagnosticKind::*;
 
-    block.content.iter().find_map(|(_b, items)| {
-        items.iter().find_map(|item| {
-            let item_ident = match item {
-                Item::Fn(obj) if *kind == Function => &obj.sig.ident,
-                Item::Static(obj) if *kind == Static => &obj.ident,
-                Item::Type(obj) if *kind == TypeAlias => &obj.ident,
-                Item::Mod(obj) => return handle_mod_diagnostic(obj, kind, ident),
-                _ => return None,
-            };
-
-            if item_ident == ident {
-                Some(item.span())
-            } else {
-                None
+    items.iter().find_map(|item| {
+        let item_ident = match item {
+            Item::Const(obj) if *kind == Constant => &obj.ident,
+            Item::Enum(obj) if *kind == Enum => &obj.ident,
+            Item::Fn(obj) if *kind == Function => &obj.sig.ident,
+            Item::Macro(syn::ItemMacro {
+                ident: Some(name), ..
+            }) if *kind == MacroDefinition => name,
+            Item::Static(obj) if *kind == Static => &obj.ident,
+            Item::Struct(obj) if *kind == Struct => &obj.ident,
+            Item::Type(obj) if *kind == TypeAlias => &obj.ident,
+            Item::Union(obj) if *kind == Union => &obj.ident,
+            Item::Mod(block) => {
+                return block
+                    .content
+                    .as_ref()
+                    .and_then(|(_, items)| find_item(items, kind, ident, line));
             }
-        })
+            Item::ForeignMod(block) => {
+                return block.items.iter().find_map(|inner| {
+                    let inner_ident = match inner {
+                        ForeignItem::Fn(obj) if *kind == Function => &obj.sig.ident,
+                        ForeignItem::Static(obj) if *kind == Static => &obj.ident,
+                        ForeignItem::Type(obj) if *kind == TypeAlias => &obj.ident,
+                        _ => return None,
+                    };
+                    matches_ident(inner_ident, ident, line).then(|| inner.span())
+                });
+            }
+            Item::Impl(block) => {
+                return block.items.iter().find_map(|inner| {
+                    let inner_ident = match inner {
+                        ImplItem::Const(obj) if *kind == Constant => &obj.ident,
+                        ImplItem::Fn(obj) if *kind == AssociatedFunction => &obj.sig.ident,
+                        ImplItem::Type(obj) if *kind == TypeAlias => &obj.ident,
+                        _ => return None,
+                    };
+                    matches_ident(inner_ident, ident, line).then(|| inner.span())
+                });
+            }
+            _ => return None,
+        };
+        matches_ident(item_ident, ident, line).then(|| item.span())
     })
+}
+
+fn matches_ident(item_ident: &syn::Ident, ident: &str, line: Option<usize>) -> bool {
+    *item_ident == ident && line.is_none_or(|l| item_ident.span().start().line == l)
 }
 
 fn expand_ranges_to_include_whitespace<'a>(
@@ -186,7 +175,7 @@ pub fn delete_chunks(src: &[u8], chunks_to_delete: &[Range<usize>]) -> Vec<u8> {
 /// delete identifiers there ...  probably?
 pub fn rust_delete(
     src: &[u8],
-    diagnostics: impl IntoIterator<Item = (UnusedDiagnosticKind, String)>,
+    diagnostics: impl IntoIterator<Item = (UnusedDiagnosticKind, String, Option<usize>)>,
 ) -> Result<Vec<u8>, syn::Error> {
     let chunks_to_delete =
         expand_ranges_to_include_whitespace(src, diagnostics_to_ranges(src, diagnostics)?);
@@ -195,7 +184,9 @@ pub fn rust_delete(
 }
 
 /// Processes a list of file+list-of-edits into an iterator of
-/// filenames+proposed new contents
+/// filenames+proposed new contents. Drops files where no actual change was
+/// produced — otherwise the diff renderer prints a header and ellipsis with
+/// no hunks (the "useless empty diff" output).
 fn process_files<Iter: IntoIterator<Item = UnusedDiagnostic>>(
     diagnostics: impl IntoIterator<Item = (PathBuf, Iter)>,
 ) -> impl Iterator<Item = Change> {
@@ -205,18 +196,22 @@ fn process_files<Iter: IntoIterator<Item = UnusedDiagnostic>>(
             let original_content = std::fs::read(&file_name).ok()?;
             let removed_unused = rust_delete(
                 &original_content,
-                diagnostic.into_iter().map(|warn| (warn.kind, warn.ident)),
+                diagnostic
+                    .into_iter()
+                    .map(|warn| (warn.kind, warn.ident, Some(warn.span.line_start))),
             )
             .expect("syntax error");
             let proposed_content = remove_empty_blocks(&removed_unused).expect("syntax error");
 
-            let change = Change {
+            if original_content == proposed_content {
+                return None;
+            }
+
+            Some(Change {
                 file_name,
                 original_content,
                 proposed_content,
-            };
-
-            Some(change)
+            })
         })
 }
 
@@ -304,14 +299,99 @@ pub fn commit_changes(
 
 #[cfg(test)]
 mod test {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use cargo_metadata::diagnostic::DiagnosticSpan;
+
     use super::*;
 
-    fn fun(name: &str) -> (UnusedDiagnosticKind, String) {
-        (UnusedDiagnosticKind::Function, name.to_owned())
+    // Tests pass `None` for the line — the synthetic inputs use unique names,
+    // so disambiguation isn't needed and we avoid hard-coding line numbers.
+    fn fun(name: &str) -> (UnusedDiagnosticKind, String, Option<usize>) {
+        (UnusedDiagnosticKind::Function, name.to_owned(), None)
     }
 
-    fn constant(name: &str) -> (UnusedDiagnosticKind, String) {
-        (UnusedDiagnosticKind::Constant, name.to_owned())
+    fn constant(name: &str) -> (UnusedDiagnosticKind, String, Option<usize>) {
+        (UnusedDiagnosticKind::Constant, name.to_owned(), None)
+    }
+
+    fn struct_(name: &str) -> (UnusedDiagnosticKind, String, Option<usize>) {
+        (UnusedDiagnosticKind::Struct, name.to_owned(), None)
+    }
+
+    fn enum_(name: &str) -> (UnusedDiagnosticKind, String, Option<usize>) {
+        (UnusedDiagnosticKind::Enum, name.to_owned(), None)
+    }
+
+    fn union_(name: &str) -> (UnusedDiagnosticKind, String, Option<usize>) {
+        (UnusedDiagnosticKind::Union, name.to_owned(), None)
+    }
+
+    fn macro_(name: &str) -> (UnusedDiagnosticKind, String, Option<usize>) {
+        (UnusedDiagnosticKind::MacroDefinition, name.to_owned(), None)
+    }
+
+    fn assoc_fn(name: &str) -> (UnusedDiagnosticKind, String, Option<usize>) {
+        (
+            UnusedDiagnosticKind::AssociatedFunction,
+            name.to_owned(),
+            None,
+        )
+    }
+
+    // Writes `content` to a uniquely-named file under the OS temp dir and
+    // removes it on drop. Used by tests that exercise `process_diagnostics`,
+    // which reads the source from disk.
+    struct TempRust(PathBuf);
+
+    impl TempRust {
+        fn new(content: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "cargo-minify-test-{}-{}.rs",
+                std::process::id(),
+                n
+            ));
+            std::fs::write(&path, content).unwrap();
+            TempRust(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempRust {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn diag(file: &Path, line: usize, kind: UnusedDiagnosticKind, ident: &str) -> UnusedDiagnostic {
+        // DiagnosticSpan is #[non_exhaustive] so we can't construct it with a
+        // struct literal. Deserialize from JSON instead.
+        let span: DiagnosticSpan = serde_json::from_value(serde_json::json!({
+            "file_name": file.to_string_lossy(),
+            "byte_start": 0,
+            "byte_end": 0,
+            "line_start": line,
+            "line_end": line,
+            "column_start": 1,
+            "column_end": 1,
+            "is_primary": true,
+            "text": [],
+            "label": null,
+            "suggested_replacement": null,
+            "suggestion_applicability": null,
+            "expansion": null,
+        }))
+        .unwrap();
+        UnusedDiagnostic {
+            kind,
+            ident: ident.to_owned(),
+            span,
+        }
     }
 
     #[test]
@@ -444,5 +524,105 @@ mod test {
             rust_delete(src, [fun("fixme")]).unwrap(),
             b"fn foo() {}\n   fn main() {}"
         );
+    }
+
+    // The walker in handle_mod_diagnostic used to only recognize Fn/Static/Type
+    // inside nested modules. Every other kind that the top-level walker handles
+    // (Const/Enum/Struct/Union/MacroDefinition, plus AssociatedFunction inside
+    // an Impl block) was silently skipped — producing a no-op deletion.
+    // cargo-equip bundles are full of nested modules, so this gap meant
+    // cargo-minify could not act on warnings rustc emitted for items in them.
+
+    #[test]
+    fn nested_const_deletion() {
+        let src = b"mod m { const FOO: i32 = 1; }";
+        assert_eq!(rust_delete(src, [constant("FOO")]).unwrap(), b"mod m { }");
+    }
+
+    #[test]
+    fn nested_enum_deletion() {
+        let src = b"mod m { enum E {} }";
+        assert_eq!(rust_delete(src, [enum_("E")]).unwrap(), b"mod m { }");
+    }
+
+    #[test]
+    fn nested_struct_deletion() {
+        let src = b"mod m { struct S; }";
+        assert_eq!(rust_delete(src, [struct_("S")]).unwrap(), b"mod m { }");
+    }
+
+    #[test]
+    fn nested_union_deletion() {
+        let src = b"mod m { union U { a: i32 } }";
+        assert_eq!(rust_delete(src, [union_("U")]).unwrap(), b"mod m { }");
+    }
+
+    #[test]
+    fn nested_macro_definition_deletion() {
+        let src = b"mod m { macro_rules! mac { () => {} } }";
+        assert_eq!(rust_delete(src, [macro_("mac")]).unwrap(), b"mod m { }");
+    }
+
+    // Mirrors the cargo-equip bundle structure: __cargo_equip::crates::<dep>
+    // containing the items rustc warns about.
+    #[test]
+    fn deeply_nested_macro_definition_deletion() {
+        let src = b"mod outer { mod inner { macro_rules! mac { () => {} } } }";
+        assert_eq!(
+            rust_delete(src, [macro_("mac")]).unwrap(),
+            b"mod outer { mod inner { } }"
+        );
+    }
+
+    #[test]
+    fn nested_assoc_fn_deletion() {
+        let src = b"mod m { struct S; impl S { fn unused() {} } }";
+        assert_eq!(
+            rust_delete(src, [assoc_fn("unused")]).unwrap(),
+            b"mod m { struct S; impl S { } }"
+        );
+    }
+
+    // process_files used to emit a Change unconditionally, even when
+    // rust_delete couldn't locate the item and returned the source bytes
+    // unchanged. That produced the "useless empty diff" output where
+    // diff_format printed only the header and an ellipsis.
+    #[test]
+    fn process_diagnostics_drops_no_op_change() {
+        let tmp = TempRust::new("fn used() {}\n");
+        let d = diag(tmp.path(), 1, UnusedDiagnosticKind::Function, "missing");
+        let changes: Vec<_> = process_diagnostics([d]).collect();
+        assert!(
+            changes.is_empty(),
+            "expected zero changes, got {}",
+            changes.len()
+        );
+    }
+
+    // cauterize used to match items by ident alone. When two items share a
+    // name in different scopes (common in cargo-equip bundles where each
+    // vendored crate re-declares `mod macros` etc.), it picked the first
+    // lexical match regardless of which one rustc actually warned about.
+    // The diagnostic's line_start should disambiguate.
+    #[test]
+    fn process_diagnostics_disambiguates_duplicate_names_by_line() {
+        let tmp = TempRust::new("mod m { fn foo() {} }\nfn foo() {}\n");
+
+        // Diagnostic at line 2 → should remove the top-level foo only.
+        let d = diag(tmp.path(), 2, UnusedDiagnosticKind::Function, "foo");
+        let changes: Vec<_> = process_diagnostics([d]).collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].proposed_content(), b"mod m { fn foo() {} }\n");
+    }
+
+    #[test]
+    fn process_diagnostics_disambiguates_duplicate_names_by_line_nested() {
+        let tmp = TempRust::new("mod m { fn foo() {} }\nfn foo() {}\n");
+
+        // Diagnostic at line 1 → should remove only the nested foo.
+        let d = diag(tmp.path(), 1, UnusedDiagnosticKind::Function, "foo");
+        let changes: Vec<_> = process_diagnostics([d]).collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].proposed_content(), b"mod m { }\nfn foo() {}\n");
     }
 }
