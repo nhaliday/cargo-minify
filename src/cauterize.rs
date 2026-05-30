@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     ops::Range,
     path::{Path, PathBuf},
 };
@@ -74,6 +75,27 @@ fn diagnostics_to_ranges<'a>(
     Ok(ranges)
 }
 
+/// Byte ranges of `impl` blocks orphaned by deleting their Self type —
+/// i.e., blocks whose Self type matches a struct/enum/union in `diagnostics`.
+/// Both inherent (`impl Foo`) and trait (`impl T for Foo`) impls are included.
+/// See [`collect_orphaned_impls`] for the per-module scoping rules.
+fn orphaned_impl_ranges<'a>(
+    src: &'a [u8],
+    diagnostics: &'a [(UnusedDiagnosticKind, String, Option<usize>)],
+) -> Result<impl Iterator<Item = Range<usize>> + 'a, syn::Error> {
+    let s = String::from_utf8_lossy(src);
+    let parsed = syn::parse_str::<syn::File>(&s)?;
+
+    let cumulative_lengths = line_offsets(src);
+
+    let mut spans = Vec::new();
+    collect_orphaned_impls(&parsed.items, diagnostics, &mut spans);
+
+    Ok(spans
+        .into_iter()
+        .map(move |span| to_range(&cumulative_lengths, span)))
+}
+
 /// Walks `items` (the top-level items of a file or the contents of an inline
 /// `mod`) for an item matching `kind`, `ident`, and `line`. Descends into
 /// `mod`, `extern`, and `impl` blocks. The same walker runs at every depth, so
@@ -144,6 +166,70 @@ fn matches_ident(item_ident: &syn::Ident, ident: &str, line: Option<usize>) -> b
     *item_ident == ident && line.is_none_or(|l| item_ident.span().start().line == l)
 }
 
+/// Walks `items` for `impl` blocks (both inherent and trait impls) whose Self
+/// type matches a struct/enum/union being deleted. Without this, deleting
+/// `struct Foo` while leaving `impl Foo { ... }` produces non-compiling code
+/// because Foo is no longer defined.
+///
+/// Scoped per-module: a deleted type only triggers deletion of impls that are
+/// siblings in the same items list (top-level or inside the same inline `mod`).
+/// Two same-named types in sibling modules don't cross-contaminate.
+fn collect_orphaned_impls(
+    items: &[syn::Item],
+    diagnostics: &[(UnusedDiagnosticKind, String, Option<usize>)],
+    out: &mut Vec<proc_macro2::Span>,
+) {
+    use UnusedDiagnosticKind::*;
+
+    let locally_deleted: HashSet<String> = items
+        .iter()
+        .filter_map(|item| {
+            let (item_ident, item_kind) = match item {
+                syn::Item::Struct(o) => (&o.ident, Struct),
+                syn::Item::Enum(o) => (&o.ident, Enum),
+                syn::Item::Union(o) => (&o.ident, Union),
+                _ => return None,
+            };
+            diagnostics
+                .iter()
+                .any(|(kind, ident, line)| {
+                    *kind == item_kind && matches_ident(item_ident, ident, *line)
+                })
+                .then(|| item_ident.to_string())
+        })
+        .collect();
+
+    for item in items {
+        match item {
+            syn::Item::Impl(block) => {
+                if let Some(leaf) = self_type_leaf(&block.self_ty) {
+                    if locally_deleted.contains(&leaf) {
+                        out.push(block.span());
+                    }
+                }
+            }
+            syn::Item::Mod(m) => {
+                if let Some((_, inner)) = &m.content {
+                    collect_orphaned_impls(inner, diagnostics, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Returns the last path segment ident of `ty` if it's a simple type path
+/// (`Foo`, `Foo<T>`, `crate::a::Foo<T>`). Returns None for references, tuples,
+/// trait objects, etc. — those are uncommon as inherent-impl Self types and
+/// not worth the false-positive risk.
+fn self_type_leaf(ty: &syn::Type) -> Option<String> {
+    if let syn::Type::Path(syn::TypePath { qself: None, path }) = ty {
+        path.segments.last().map(|seg| seg.ident.to_string())
+    } else {
+        None
+    }
+}
+
 fn expand_ranges_to_include_whitespace<'a>(
     src: &'a [u8],
     iter: impl Iterator<Item = Range<usize>> + 'a,
@@ -177,8 +263,13 @@ pub fn rust_delete(
     src: &[u8],
     diagnostics: impl IntoIterator<Item = (UnusedDiagnosticKind, String, Option<usize>)>,
 ) -> Result<Vec<u8>, syn::Error> {
+    let diagnostics: Vec<_> = diagnostics.into_iter().collect();
+
+    let item_ranges = diagnostics_to_ranges(src, diagnostics.iter().cloned())?;
+    let impl_ranges = orphaned_impl_ranges(src, &diagnostics)?;
+
     let chunks_to_delete =
-        expand_ranges_to_include_whitespace(src, diagnostics_to_ranges(src, diagnostics)?);
+        expand_ranges_to_include_whitespace(src, item_ranges.chain(impl_ranges));
 
     Ok(delete_chunks(src, &chunks_to_delete.collect::<Vec<_>>()))
 }
@@ -613,6 +704,70 @@ mod test {
         let changes: Vec<_> = process_diagnostics([d]).collect();
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].proposed_content(), b"mod m { fn foo() {} }\n");
+    }
+
+    // Without orphan-impl deletion, `rust_delete` would leave
+    // `impl <DeletedType> { ... }` blocks behind, producing non-compiling code
+    // because the Self type no longer exists.
+    #[test]
+    fn deletes_inherent_impl_for_deleted_struct() {
+        let src = b"struct Foo; impl Foo { fn x() {} }";
+        assert_eq!(rust_delete(src, [struct_("Foo")]).unwrap(), b"");
+    }
+
+    #[test]
+    fn deletes_trait_impl_for_deleted_struct() {
+        let src = b"trait T {}\nstruct Foo;\nimpl T for Foo {}\n";
+        assert_eq!(
+            rust_delete(src, [struct_("Foo")]).unwrap(),
+            b"trait T {}\n"
+        );
+    }
+
+    #[test]
+    fn deletes_inherent_impl_for_deleted_enum() {
+        let src = b"enum E { A } impl E { fn x() {} }";
+        assert_eq!(rust_delete(src, [enum_("E")]).unwrap(), b"");
+    }
+
+    #[test]
+    fn deletes_inherent_impl_for_deleted_union() {
+        let src = b"union U { a: u32 } impl U { fn x() {} }";
+        assert_eq!(rust_delete(src, [union_("U")]).unwrap(), b"");
+    }
+
+    #[test]
+    fn keeps_impls_for_unrelated_types() {
+        let src = b"struct Foo; struct Bar; impl Bar { fn x() {} }";
+        assert_eq!(
+            rust_delete(src, [struct_("Foo")]).unwrap(),
+            b"struct Bar; impl Bar { fn x() {} }"
+        );
+    }
+
+    #[test]
+    fn deletes_impl_in_same_nested_module() {
+        let src = b"mod m { struct Foo; impl Foo { fn x() {} } }";
+        assert_eq!(rust_delete(src, [struct_("Foo")]).unwrap(), b"mod m { }");
+    }
+
+    // Two same-named types in sibling modules must not cross-contaminate:
+    // deleting `a::Foo` only should leave `b`'s impl intact.
+    #[test]
+    fn does_not_delete_impl_in_sibling_module_with_same_type_name() {
+        let src =
+            b"mod a { struct Foo; impl Foo {} }\nmod b { struct Foo; impl Foo {} }\n";
+        let only_a = (UnusedDiagnosticKind::Struct, "Foo".to_owned(), Some(1));
+        assert_eq!(
+            rust_delete(src, [only_a]).unwrap(),
+            b"mod a { }\nmod b { struct Foo; impl Foo {} }\n"
+        );
+    }
+
+    #[test]
+    fn deletes_generic_impl_for_deleted_struct() {
+        let src = b"struct Foo<T>(T); impl<T> Foo<T> { fn x(&self) {} }";
+        assert_eq!(rust_delete(src, [struct_("Foo")]).unwrap(), b"");
     }
 
     #[test]

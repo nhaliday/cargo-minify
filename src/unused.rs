@@ -194,7 +194,7 @@ impl TryFrom<Diagnostic> for UnusedDiagnostic {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum UnusedDiagnosticKind {
     Constant,
     Static,
